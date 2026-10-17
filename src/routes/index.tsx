@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { z } from "zod";
+import { supabase } from "@/lib/supabase-client";
 
 import {
   Transaction,
@@ -90,41 +91,84 @@ function Index() {
   const [errors, setErrors] = useState<{ description?: string; amount?: string }>({});
   const [isHydrated, setIsHydrated] = useState(false);
 
-  useEffect(() => {
+ useEffect(() => {
+  let cancelled = false;
+
+  async function loadData() {
     try {
-      const rawTx = localStorage.getItem(TRANSACTIONS_STORAGE_KEY);
-      if (rawTx) {
-        const parsed = JSON.parse(rawTx) as StoredTransaction[];
-        setTransactions(parsed.map(migrateTransaction));
+      if (!supabase) {
+        throw new Error("Supabase is not configured.");
       }
-    } catch {
-      setTransactions([]);
-    }
 
-    try {
-      const rawBudgets = localStorage.getItem(BUDGETS_STORAGE_KEY);
-      if (rawBudgets) {
-        setBudgets(JSON.parse(rawBudgets));
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+
+      if (!user) {
+        throw new Error("Please sign in to load your finance data.");
       }
-    } catch {
-      setBudgets(DEFAULT_BUDGETS);
-    }
 
-    setCurrency(getStoredCurrency());
-    setIsHydrated(true);
-  }, []);
+      const [transactionsResult, budgetsResult] = await Promise.all([
+        supabase
+          .from("transactions")
+          .select("*")
+          .eq("user_id", user.id)
+          .order("created_at", { ascending: false }),
 
-  useEffect(() => {
-    if (isHydrated) {
-      localStorage.setItem(TRANSACTIONS_STORAGE_KEY, JSON.stringify(transactions));
-    }
-  }, [transactions, isHydrated]);
+        supabase
+          .from("budgets")
+          .select("*")
+          .eq("user_id", user.id)
+          .maybeSingle(),
+      ]);
 
-  useEffect(() => {
-    if (isHydrated) {
-      localStorage.setItem(BUDGETS_STORAGE_KEY, JSON.stringify(budgets));
+      if (transactionsResult.error) throw transactionsResult.error;
+      if (budgetsResult.error) throw budgetsResult.error;
+
+      if (cancelled) return;
+
+      setTransactions(
+        (transactionsResult.data ?? []).map((row) => ({
+          id: row.id,
+          description: row.description,
+          amount: Number(row.amount),
+          type: row.type as TransactionType,
+          category: row.category as ExpenseCategory | "Income",
+          createdAt: new Date(row.created_at).getTime(),
+        })),
+      );
+
+      if (budgetsResult.data) {
+        setBudgets({
+          overall:
+            budgetsResult.data.overall == null
+              ? null
+              : Number(budgetsResult.data.overall),
+          byCategory: budgetsResult.data.by_category ?? {},
+        });
+      } else {
+        setBudgets(DEFAULT_BUDGETS);
+      }
+
+      setCurrency(getStoredCurrency());
+    } catch (error) {
+      console.error("Failed to load finance data:", error);
+    } finally {
+      if (!cancelled) {
+        setIsHydrated(true);
+      }
     }
-  }, [budgets, isHydrated]);
+  }
+
+  void loadData();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
 
   // All amounts are stored in the base currency (INR). This formats any
   // base-currency amount into the user's currently selected display currency.
@@ -141,6 +185,40 @@ function Index() {
     setCurrency(next);
     setRates(nextRates);
   }
+  
+  async function handleBudgetChange(nextBudgets: BudgetLimits) {
+    try {
+      if (!supabase) {
+        throw new Error("Supabase is not configured.");
+      }
+
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+      if (!user) throw new Error("Please sign in first.");
+
+      const { error } = await supabase.from("budgets").upsert(
+        {
+          user_id: user.id,
+          overall: nextBudgets.overall,
+          by_category: nextBudgets.byCategory,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      );
+
+      if (error) throw error;
+
+      setBudgets(nextBudgets);
+    } catch (error) {
+      console.error("Failed to save budgets:", error);
+      alert("Could not save your budget. Please try again.");
+    }
+  }
+
 
   const totals = useMemo(() => {
     const income = transactions
@@ -169,24 +247,61 @@ function Index() {
     return totalsByCategory;
   }, [transactions]);
 
-  function addTransaction(data: {
+ 
+  async function addTransaction(data: {
     description: string;
     amount: number;
     type: TransactionType;
     category: ExpenseCategory | "Income";
   }) {
-    const newTransaction: Transaction = {
-      id: generateId(),
-      description: data.description,
-      amount: data.amount,
-      type: data.type,
-      category: data.category,
-      createdAt: Date.now(),
-    };
-    setTransactions((prev) => [newTransaction, ...prev]);
+    try {
+      if (!supabase) {
+        throw new Error("Supabase is not configured.");
+      }
+
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+      if (!user) throw new Error("Please sign in first.");
+
+      const { data: row, error } = await supabase
+        .from("transactions")
+        .insert({
+          user_id: user.id,
+          description: data.description,
+          amount: data.amount,
+          type: data.type,
+          category: data.category,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      const newTransaction: Transaction = {
+        id: row.id,
+        description: row.description,
+        amount: Number(row.amount),
+        type: row.type as TransactionType,
+        category: row.category as ExpenseCategory | "Income",
+        createdAt: new Date(row.created_at).getTime(),
+      };
+
+      setTransactions((prev) => [newTransaction, ...prev]);
+      return true;
+    } catch (error) {
+      console.error("Failed to add transaction:", error);
+      alert("Could not save the transaction. Please try again.");
+      return false;
+    }
   }
 
-  function handleAddTransaction(e: React.FormEvent) {
+
+ 
+  async function handleAddTransaction(e: React.FormEvent) {
     e.preventDefault();
 
     const parsedAmount = parseFloat(amount);
@@ -198,37 +313,42 @@ function Index() {
 
     if (!result.success) {
       const fieldErrors: { description?: string; amount?: string } = {};
+
       for (const issue of result.error.issues) {
         const path = issue.path[0] as "description" | "amount";
         if (!fieldErrors[path]) {
           fieldErrors[path] = issue.message;
         }
       }
+
       setErrors(fieldErrors);
       return;
     }
 
     setErrors({});
 
-    addTransaction({
+    const saved = await addTransaction({
       description: result.data.description,
       amount: result.data.amount,
       type: result.data.type,
       category: result.data.type === "income" ? "Income" : category,
     });
 
-    setDescription("");
-    setAmount("");
-    setType("expense");
-    setCategory("Other");
+    if (saved) {
+      setDescription("");
+      setAmount("");
+      setType("expense");
+      setCategory("Other");
+    }
   }
 
-  function handleReceiptConfirm(data: {
+
+  async function handleReceiptConfirm(data: {
     description: string;
     amount: number;
     category: ExpenseCategory;
   }) {
-    addTransaction({
+    await addTransaction({
       description: data.description,
       amount: data.amount,
       type: "expense",
@@ -236,13 +356,36 @@ function Index() {
     });
   }
 
-  function handleDelete(id: string) {
-    setTransactions((prev) => prev.filter((t) => t.id !== id));
+
+  async function handleDelete(id: string) {
+    try {
+      if (!supabase) {
+        throw new Error("Supabase is not configured.");
+      }
+
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+      if (!user) throw new Error("Please sign in first.");
+
+      const { error } = await supabase
+        .from("transactions")
+        .delete()
+        .eq("id", id)
+        .eq("user_id", user.id);
+
+      if (error) throw error;
+
+      setTransactions((prev) => prev.filter((t) => t.id !== id));
+    } catch (error) {
+      console.error("Failed to delete transaction:", error);
+      alert("Could not delete the transaction. Please try again.");
+    }
   }
 
-  if (!isHydrated) {
-    return null;
-  }
 
   return (
     <div className="min-h-screen bg-background px-4 py-8 sm:py-12">
@@ -370,7 +513,7 @@ function Index() {
 
         <BudgetManager
           budgets={budgets}
-          onChange={setBudgets}
+          onChange={handleBudgetChange}
           spendingByCategory={spendingByCategory}
           formatAmount={formatAmount}
         />
