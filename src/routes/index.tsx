@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import { z } from "zod";
+import { useAuth } from "@/lib/use-auth";
 import { supabase } from "@/lib/supabase-client";
-
 import {
   Transaction,
   TransactionType,
@@ -79,6 +79,7 @@ function migrateTransaction(raw: StoredTransaction): Transaction {
 }
 
 function Index() {
+  const { user, loading } = useAuth();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [budgets, setBudgets] = useState<BudgetLimits>(DEFAULT_BUDGETS);
   const [currency, setCurrency] = useState<CurrencyCode>("INR");
@@ -356,6 +357,10 @@ function Index() {
     });
   }
 
+  async function handleLogout() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+  }
 
   async function handleDelete(id: string) {
     try {
@@ -386,6 +391,19 @@ function Index() {
     }
   }
 
+  if (loading) {
+    return null;
+  }
+
+  if (!user) {
+    window.location.href = "/auth";
+    return null;
+  }
+
+  if (!isHydrated) {
+    return null;
+  }
+
 
   return (
     <div className="min-h-screen bg-background px-4 py-8 sm:py-12">
@@ -397,7 +415,16 @@ function Index() {
           <p className="text-muted-foreground">
             Track your income and expenses, forecast the future, and stay on budget.
           </p>
-          <CurrencySwitcher currency={currency} onChange={handleCurrencyChange} />
+         <div className="flex items-center gap-3">
+            <CurrencySwitcher currency={currency} onChange={handleCurrencyChange} />
+
+            <button
+              type="button"
+              onClick={handleLogout}
+             className="rounded-xl bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700" >
+              Logout
+            </button>
+          </div>
         </header>
 
         <section aria-label="Summary" className="grid grid-cols-1 gap-4 sm:grid-cols-3">
